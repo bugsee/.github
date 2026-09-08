@@ -1,0 +1,195 @@
+name: Artifact retention
+
+# Keeps at most KEEP_PER_NAME artifacts of each NAME in every PRIVATE repo in
+# the org, deleting the rest oldest-first.
+#
+# ⚠️ WHY THIS EXISTS AT ALL: GitHub HAS NO COUNT-BASED RETENTION. The only
+# native control is time — the org setting, a repo setting that may lower it,
+# and `retention-days:` on the upload — so "keep the last N" has to be a
+# scheduled sweep. There is no REST endpoint for the retention VALUE either;
+# it is a UI setting. Nothing here changes those settings, and they keep
+# applying on their own: this only deletes early.
+#
+# ⚠️ THIS RUNS IN A PUBLIC REPOSITORY, DELIBERATELY. Actions minutes and
+# artifact storage are free for public repos, so the sweep costs nothing and
+# does not compete with the private repos it is cleaning up. It also means the
+# workflow file is world-readable — which is fine, it carries no secrets, but
+# it is why the token is a repository secret rather than anything inline.
+#
+# ⚠️ ONLY PRIVATE REPOS ARE TOUCHED. Public repos do not consume the storage
+# quota, so deleting their artifacts buys nothing and only destroys evidence
+# someone may still want.
+
+on:
+  schedule:
+    # 04:17 UTC daily. Off the hour on purpose: the top of the hour is when
+    # every other cron on GitHub fires and scheduled runs get queued behind it.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'List what would be deleted without deleting it'
+        type: boolean
+        default: true
+      keep:
+        description: 'How many artifacts to keep per name'
+        type: string
+        default: '3'
+
+concurrency:
+  group: artifact-retention
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  sweep:
+    name: sweep private repo artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # ⚠️ NOT `GITHUB_TOKEN`. That token is scoped to the repository the
+      # workflow runs in, so it cannot list — let alone delete — anything in
+      # the private repos this sweep exists to clean. Needs a fine-grained PAT
+      # or GitHub App installation token with `actions: write` (which implies
+      # read) on the org's repositories, plus `metadata: read` to enumerate
+      # them. Store it as the ARTIFACT_CLEANUP_TOKEN repository secret.
+      GH_TOKEN: ${{ secrets.ARTIFACT_CLEANUP_TOKEN }}
+      ORG: ${{ github.repository_owner }}
+      # A dispatch passes its own value; a scheduled run supplies no inputs at
+      # all, so the fallbacks below are what the cron actually uses: live, keep 3.
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      KEEP_PER_NAME: ${{ github.event.inputs.keep || '3' }}
+
+    steps:
+      # Fail here with a sentence someone can act on, rather than 40 lines
+      # later as an opaque 401 from the first API call.
+      - name: Check the token is present
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::ARTIFACT_CLEANUP_TOKEN is not set on this repository."
+            echo "::error::Create a fine-grained PAT (or GitHub App installation token) with"
+            echo "::error::Actions: read and write + Metadata: read on the ${ORG} org, and store"
+            echo "::error::it as the ARTIFACT_CLEANUP_TOKEN repository secret."
+            exit 1
+          fi
+
+      - name: Sweep
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          from collections import defaultdict
+
+          ORG   = os.environ['ORG']
+          KEEP  = int(os.environ['KEEP_PER_NAME'])
+          DRY   = os.environ['DRY_RUN'].strip().lower() == 'true'
+          MB    = 1024 * 1024
+
+
+          def gh(*args):
+              """gh api. Raises on failure so callers can decide what is fatal."""
+              out = subprocess.run(['gh', 'api', *args],
+                                   capture_output=True, text=True)
+              if out.returncode != 0:
+                  raise RuntimeError(out.stderr.strip() or f'gh api {args} failed')
+              return out.stdout
+
+
+          def paginated(path, jq):
+              """Every page as newline-delimited JSON, one object per line.
+
+              ⚠️ `--paginate` CONCATENATES PAGES RAW: two pages of an array
+              endpoint arrive as `[...][...]`, which no JSON parser accepts.
+              Letting --jq flatten to one object per line sidesteps the problem
+              entirely rather than trying to re-split the stream.
+              """
+              raw = gh('--paginate', path, '--jq', jq)
+              return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+
+          repos = [r for r in
+                   paginated(f'/orgs/{ORG}/repos?per_page=100&type=private', '.[] | @json')
+                   if r.get('private')]
+          print(f'{len(repos)} private repos in {ORG}; keeping {KEEP} per artifact name')
+          print(f'mode: {"DRY RUN — nothing will be deleted" if DRY else "LIVE"}\n')
+
+          # ⚠️ NOTHING BELOW MAY NAME A PRIVATE REPOSITORY OR ARTIFACT. THIS JOB
+          # RUNS IN A PUBLIC REPOSITORY, SO ITS LOGS ARE WORLD-READABLE — and a
+          # run log is the one output of this workflow that anyone can read
+          # without being a member of the org. Printing the repo list would
+          # publish the org's private inventory (product names, unreleased work)
+          # to anyone who opens the Actions tab, permanently and indexably.
+          #
+          # So the log carries COUNTS ONLY. Failures are reported against an
+          # opaque index into the sorted repo list rather than a name; if one
+          # needs chasing, re-run the same logic from somewhere private where
+          # the names are safe to print.
+          total_deleted = total_bytes = total_considered = 0
+          repos_touched = 0
+          failures = []
+
+          for index, repo in enumerate(sorted(r['name'] for r in repos)):
+              try:
+                  arts = paginated(
+                      f'/repos/{ORG}/{repo}/actions/artifacts?per_page=100',
+                      '.artifacts[] | @json')
+              except RuntimeError as exc:
+                  # One inaccessible repo must not abort the sweep of the rest.
+                  failures.append((f'repo #{index}', str(exc)))
+                  continue
+
+              # An expired artifact is already gone; deleting it 404s.
+              live = [a for a in arts if not a.get('expired')]
+              if not live:
+                  continue
+              total_considered += len(live)
+
+              by_name = defaultdict(list)
+              for a in live:
+                  by_name[a['name']].append(a)
+
+              doomed = []
+              for group in by_name.values():
+                  # Newest first, so everything past KEEP is the older tail.
+                  group.sort(key=lambda a: a['created_at'], reverse=True)
+                  doomed += group[KEEP:]
+
+              if not doomed:
+                  continue
+              repos_touched += 1
+
+              if DRY:
+                  total_deleted += len(doomed)
+                  total_bytes += sum(a['size_in_bytes'] for a in doomed)
+                  continue
+
+              for a in sorted(doomed, key=lambda a: a['created_at']):
+                  try:
+                      gh('--method', 'DELETE',
+                         f"/repos/{ORG}/{repo}/actions/artifacts/{a['id']}")
+                      total_deleted += 1
+                      total_bytes += a['size_in_bytes']
+                  except RuntimeError as exc:
+                      # Most likely it expired between listing and deleting.
+                      failures.append((f'repo #{index}', str(exc)))
+
+          verb = 'would delete' if DRY else 'deleted'
+          print(f'considered {total_considered} live artifacts across '
+                f'{len(repos)} private repos')
+          print(f'{verb} {total_deleted} artifacts across {repos_touched} repos, '
+                f'{"freeing" if DRY else "freed"} {total_bytes/MB:.0f} MB')
+
+          if failures:
+              print(f'\n{len(failures)} failure(s):')
+              for where, why in failures:
+                  # The error text comes from the API, not from us; it can name
+                  # the repo, so it is reduced to its first line and stripped of
+                  # anything that looks like a path.
+                  first = why.splitlines()[0] if why else 'unknown error'
+                  print(f'  {where}: {first.split("/")[0].strip()[:120]}')
+              # Surfaced, not fatal: a partial sweep still helped, and the next
+              # run retries. A token that cannot see anything trips the check
+              # above instead.
+              print('::warning::some repositories or artifacts could not be swept')
+          PY
