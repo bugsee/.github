@@ -1,24 +1,32 @@
 name: Claude PR Review
 
-# Intended to be run org-wide via an org ruleset ("Require workflows to pass").
-# Requires org secret CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token` as the
-# dedicated Team-plan user) shared with all repositories.
+# Reusable workflow. Each repository calls it from a small caller workflow
+# (see claude-review-caller.yml). Requires the org secret CLAUDE_CODE_OAUTH_TOKEN
+# (from `claude setup-token` as the dedicated Team-plan user).
 
 on:
-  pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
 
 jobs:
   review:
     # Skip drafts, plus two kinds of PR that cannot run this job:
     # - forks: a fork's pull_request run gets no secrets and a read-only token
     # - dependabot: reads Dependabot secrets, and the action refuses bot actors
+    # Adding any label fires a `labeled` event; only the deep-review label should start a run.
     if: |
+      (github.event.action != 'labeled' || github.event.label.name == 'deep-review') &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # One review at a time per PR: a new push or the label being added replaces a run in progress.
+    concurrency:
+      group: claude-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     # Never block merging because the review job itself failed.
     continue-on-error: true
     permissions:
@@ -92,7 +100,10 @@ jobs:
             * Post the final summary (overall risk, merge recommendation, key issues, positives) as one top-level PR comment.
             * If you find no real issues, say so in the summary rather than inventing findings.
             * Do not push commits or modify any files.
+          # Opus when the PR has the `deep-review` label, Sonnet otherwise.
           claude_args: >-
+            --model ${{ contains(github.event.pull_request.labels.*.name, 'deep-review') && 'claude-opus-5-5' || 'claude-sonnet-5-5' }}
+            --effort high
             --allowedTools
             "Read,Grep,Glob,Bash,mcp__github_inline_comment__create_inline_comment"
           # --allowedTools REPLACES the default tool list rather than adding to it, so every
