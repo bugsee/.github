@@ -62,12 +62,17 @@ jobs:
 
       - name: Install Claude Code
         id: claude
+        # Explicit shell: the default `bash -e {0}` has no pipefail, so a 429 from curl
+        # would feed bash empty input, exit 0, and end the retry loop as a "success".
+        shell: bash
         run: |
           BIN="$HOME/.local/bin/claude"
           if ! "$BIN" --version 2>/dev/null | grep -qF "$CLAUDE_CODE_VERSION"; then
             installed=false
             for i in 1 2 3 4 5 6; do
-              if curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"; then
+              # Success means the pinned version actually runs, not just that the pipe exited 0.
+              if curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION" \
+                && "$BIN" --version 2>/dev/null | grep -qF "$CLAUDE_CODE_VERSION"; then
                 installed=true
                 break
               fi
