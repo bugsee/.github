@@ -26,6 +26,8 @@ jobs:
     # code off our machines.
     runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
+    env:
+      CLAUDE_CODE_VERSION: "2.1.308"
     # One review at a time per PR: a new push or the label being added replaces a run in progress.
     concurrency:
       group: claude-review-${{ github.repository }}-${{ github.event.pull_request.number }}
@@ -44,9 +46,44 @@ jobs:
         with:
           fetch-depth: 0
 
+      # claude-code-action installs Claude Code itself with `curl claude.ai/install.sh`:
+      # 3 attempts, 5 s apart. claude.ai rate-limits per IP and our runners share one,
+      # so a burst of PRs gets 429 on all three and the job fails without reviewing
+      # anything. Install it here instead: reuse a cached/pre-installed copy, and
+      # retry with a long, jittered backoff. The version is the one the action pins
+      # (src/entrypoints/run.ts); bump it together with the action.
+      - name: Restore Claude Code
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/bin/claude
+            ~/.local/share/claude
+          key: claude-code-${{ runner.os }}-${{ runner.arch }}-${{ env.CLAUDE_CODE_VERSION }}
+
+      - name: Install Claude Code
+        id: claude
+        run: |
+          BIN="$HOME/.local/bin/claude"
+          if ! "$BIN" --version 2>/dev/null | grep -qF "$CLAUDE_CODE_VERSION"; then
+            installed=false
+            for i in 1 2 3 4 5 6; do
+              if curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"; then
+                installed=true
+                break
+              fi
+              delay=$(( 20 * i + RANDOM % 15 ))
+              echo "Claude Code install attempt $i failed; retrying in ${delay}s"
+              sleep "$delay"
+            done
+            "$installed" || { echo "::error::Could not install Claude Code after 6 attempts"; exit 1; }
+          fi
+          "$BIN" --version
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_claude_code_executable: ${{ steps.claude.outputs.bin }}
           track_progress: true
           # Keep the full agent transcript out of the job logs: Actions logs of public
           # repositories are world-readable. To debug a silent run, enable it on a
