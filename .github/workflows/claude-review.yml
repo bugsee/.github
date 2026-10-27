@@ -15,12 +15,16 @@ jobs:
     # Skip drafts, plus two kinds of PR that cannot run this job:
     # - forks: a fork's pull_request run gets no secrets and a read-only token
     # - dependabot: reads Dependabot secrets, and the action refuses bot actors
+    # - coderabbitai: it also triggers pull_request events (e.g. while it updates the PR), and the
+    #   action then fails with "Workflow initiated by non-human actor"; skip those runs instead of
+    #   allowing the bot, so the review still runs for every human push
     # Adding any label fires a `labeled` event; only the deep-review label should start a run.
     if: |
       (github.event.action != 'labeled' || github.event.label.name == 'deep-review') &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]'
+      github.actor != 'dependabot[bot]' &&
+      github.actor != 'coderabbitai[bot]'
     # Private repos use our self-hosted pool (GitHub-hosted minutes are billed); public
     # repos use GitHub-hosted runners, which are free for them and keep untrusted PR
     # code off our machines.
