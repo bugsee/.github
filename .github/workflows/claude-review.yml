@@ -17,14 +17,17 @@ jobs:
     # - dependabot: reads Dependabot secrets, and the action refuses bot actors
     # - coderabbitai: it also triggers pull_request events (e.g. while it updates the PR), and the
     #   action then fails with "Workflow initiated by non-human actor"; skip those runs instead of
-    #   allowing the bot, so the review still runs for every human push
+    #   allowing the bot, so the review still runs for every human push. The one exception is
+    #   coderabbitai adding the deep-review label: that is an explicit request for a deep review,
+    #   so it runs (and the action is told to accept that bot via allowed_bots below)
     # Adding any label fires a `labeled` event; only the deep-review label should start a run.
     if: |
       (github.event.action != 'labeled' || github.event.label.name == 'deep-review') &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'dependabot[bot]' &&
-      github.actor != 'coderabbitai[bot]'
+      (github.actor != 'coderabbitai[bot]' ||
+        (github.event.action == 'labeled' && github.event.label.name == 'deep-review'))
     # Private repos use our self-hosted pool (GitHub-hosted minutes are billed); public
     # repos use GitHub-hosted runners, which are free for them and keep untrusted PR
     # code off our machines.
@@ -94,6 +97,9 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           path_to_claude_code_executable: ${{ steps.claude.outputs.bin }}
           track_progress: true
+          # Lets the label-triggered run started by coderabbitai through the action's
+          # non-human-actor check; the job-level `if` still skips its other events.
+          allowed_bots: coderabbitai
           # Keep the full agent transcript out of the job logs: Actions logs of public
           # repositories are world-readable. To debug a silent run, enable it on a
           # short-lived branch and remove it again.
