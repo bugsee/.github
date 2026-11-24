@@ -96,7 +96,11 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           path_to_claude_code_executable: ${{ steps.claude.outputs.bin }}
-          track_progress: true
+          # Deliberately NOT `track_progress: true`: that forces the action's "tag" mode, which
+          # pre-fetches the whole PR (every comment, review and inline thread) and pastes it into
+          # the prompt. On a long-lived PR that is 100k+ tokens, and the model call fails on the
+          # first turn (is_error, num_turns 1, no model usage). Without it a `prompt` runs in
+          # agent mode: the prompt below is sent as written and the agent fetches what it needs.
           # Lets the label-triggered run started by coderabbitai through the action's
           # non-human-actor check; the job-level `if` still skips its other events.
           allowed_bots: coderabbitai
@@ -150,9 +154,17 @@ jobs:
 
             ## How to post the review
 
+            ## How to read the PR
+
+            Nothing about the PR is included above except its number, so fetch it yourself with `gh`, and only as much as you need:
+
+            * `gh pr view ${{ github.event.pull_request.number }} --json title,body,baseRefName,headRefName,files` for the description and changed files, and `gh pr diff ${{ github.event.pull_request.number }}` for the diff (use `--name-only`, or read the files in the checkout, for a very large PR).
+            * Earlier review feedback can be very large on a long-lived PR. Do not dump it all. List only your own previous comments and the unresolved threads, for example `gh api --paginate repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments --jq '.[] | select(.user.login=="claude[bot]") | {path,line,body: .body[0:300]}'` and `gh pr view ${{ github.event.pull_request.number }} --comments` limited with `--jq`/`head`, then open individual comments only when one matters.
+            * Other reviewers' comments (for example CodeRabbit) are optional context: skim them only when you need to know whether something was already raised.
+
             * This workflow also runs on every push to the PR. Before commenting, read your existing review comments and the PR conversation. Do not repeat findings you already reported; only add new ones, and mention in the summary when earlier findings look fixed by the latest commits.
             * Post each finding as an inline comment on its file and line, using the format above.
-            * Post the final summary (overall risk, merge recommendation, key issues, positives) as one top-level PR comment.
+            * Post the final summary (overall risk, merge recommendation, key issues, positives) as one top-level PR comment, with `gh pr comment ${{ github.event.pull_request.number }} --body-file -` with a heredoc (you have no file-write tool).
             * If you find no real issues, say so in the summary rather than inventing findings.
             * Do not push commits or modify any files.
           # Opus when the PR has the `deep-review` label, Sonnet otherwise.
