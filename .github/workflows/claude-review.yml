@@ -156,11 +156,11 @@ jobs:
 
             ## How to read the PR
 
-            Nothing about the PR is included above except its number, so fetch it yourself with `gh`, and only as much as you need:
+            The PR itself is not included above, only its number. A thorough review depends on you pulling the full picture with `gh` first: the description and intent, every changed file, the complete diff, and the prior review discussion. Gather all of it before you start judging the code.
 
             * `gh pr view ${{ github.event.pull_request.number }} --json title,body,baseRefName,headRefName,files` for the description and changed files, and `gh pr diff ${{ github.event.pull_request.number }}` for the diff (use `--name-only`, or read the files in the checkout, for a very large PR).
-            * Earlier review feedback can be very large on a long-lived PR. Do not dump it all. List only your own previous comments and the unresolved threads, for example `gh api --paginate repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments --jq '.[] | select(.user.login=="claude[bot]") | {path,line,body: .body[0:300]}'` and `gh pr view ${{ github.event.pull_request.number }} --comments` limited with `--jq`/`head`, then open individual comments only when one matters.
-            * Other reviewers' comments (for example CodeRabbit) are optional context: skim them only when you need to know whether something was already raised.
+            * Read the earlier review discussion in full, because it tells you what was already raised, what was fixed, and what was dismissed and why. Use `gh pr view ${{ github.event.pull_request.number }} --comments` and `gh api --paginate repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments` (add `--jq` to pick the fields you need), and open any thread that bears on the code you are reviewing.
+            * Include the other reviewers' comments (for example CodeRabbit's) as well: they point at risky areas worth verifying, and they show which findings must not be repeated.
 
             * This workflow also runs on every push to the PR. Before commenting, read your existing review comments and the PR conversation. Do not repeat findings you already reported; only add new ones, and mention in the summary when earlier findings look fixed by the latest commits.
             * Post each finding as an inline comment on its file and line, using the format above.
