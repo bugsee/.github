@@ -53,9 +53,14 @@ jobs:
       checks: read
       id-token: write
     steps:
+      # Shallow checkout: the review reads the PR through `gh pr view` / `gh pr diff` (API) and
+      # reads files from the working tree, so it needs no history. `fetch-depth: 0` re-downloaded
+      # every branch and tag on each run (the whole repo, 100 MB+ for the larger ones), and when
+      # GitHub throttled the runners' shared IP (HTTP 429) that checkout crawled at ~40 KB/s and
+      # held a runner for the full 30-minute timeout.
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       # claude-code-action installs Claude Code itself with `curl claude.ai/install.sh`:
       # 3 attempts, 5 s apart. claude.ai rate-limits per IP and our runners share one,
